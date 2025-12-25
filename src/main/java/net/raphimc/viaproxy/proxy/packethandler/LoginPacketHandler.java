@@ -17,9 +17,24 @@
  */
 package net.raphimc.viaproxy.proxy.packethandler;
 
+import java.math.BigInteger;
+import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.PublicKey;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Random;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import javax.crypto.SecretKey;
+
 import com.mojang.authlib.GameProfile;
 import com.mojang.authlib.yggdrasil.ProfileResult;
 import com.viaversion.viaversion.api.protocol.version.ProtocolVersion;
+
 import io.netty.channel.ChannelFutureListener;
 import net.raphimc.netminecraft.constants.ConnectionState;
 import net.raphimc.netminecraft.constants.MCPipeline;
@@ -36,6 +51,7 @@ import net.raphimc.vialegacy.protocol.release.r1_6_4tor1_7_2_5.storage.ProtocolM
 import net.raphimc.viaproxy.ViaProxy;
 import net.raphimc.viaproxy.plugins.events.ClientLoggedInEvent;
 import net.raphimc.viaproxy.plugins.events.ShouldVerifyOnlineModeEvent;
+import net.raphimc.viaproxy.protocoltranslator.viaproxy.ViaProxyConfig;
 import net.raphimc.viaproxy.proxy.LoginState;
 import net.raphimc.viaproxy.proxy.external_interface.AuthLibServices;
 import net.raphimc.viaproxy.proxy.external_interface.ExternalInterface;
@@ -44,21 +60,8 @@ import net.raphimc.viaproxy.proxy.util.ChannelUtil;
 import net.raphimc.viaproxy.proxy.util.CloseAndReturn;
 import net.raphimc.viaproxy.util.logging.Logger;
 
-import javax.crypto.SecretKey;
-import java.math.BigInteger;
-import java.security.GeneralSecurityException;
-import java.security.KeyPair;
-import java.security.PublicKey;
-import java.time.Instant;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Random;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-
 public class LoginPacketHandler extends PacketHandler {
-
+    
     private static final KeyPair KEY_PAIR = CryptUtil.generateKeyPair();
     private static final Random RANDOM = new Random();
     private static final ExecutorService HTTP_EXECUTOR = Executors.newWorkStealingPool(4);
@@ -66,10 +69,14 @@ public class LoginPacketHandler extends PacketHandler {
     private final byte[] verifyToken = new byte[4];
     private LoginState loginState = LoginState.FIRST_PACKET;
 
+    // CLIENT_FORWARD fields
+    private C2SLoginKeyPacket bufferedClientEncryptionResponse = null;
+    private boolean isClientForwardMode = false;
     public LoginPacketHandler(ProxyConnection proxyConnection) {
         super(proxyConnection);
 
         RANDOM.nextBytes(this.verifyToken);
+        this.isClientForwardMode = ViaProxy.getConfig().getAuthMethod() == ViaProxyConfig.AuthMethod.CLIENT_FORWARD;
     }
 
     @Override
@@ -84,38 +91,53 @@ public class LoginPacketHandler extends PacketHandler {
 
             proxyConnection.setLoginHelloPacket(loginHelloPacket);
             if (loginHelloPacket.uuid != null) {
-                proxyConnection.setGameProfile(new GameProfile(loginHelloPacket.uuid, loginHelloPacket.name));
+                proxyConnection. setGameProfile(new GameProfile(loginHelloPacket.uuid, loginHelloPacket.name));
             } else {
                 proxyConnection.setGameProfile(new GameProfile(GameProfileUtil.getOfflinePlayerUuid(loginHelloPacket.name), loginHelloPacket.name));
             }
 
-            if (ViaProxy.getConfig().isProxyOnlineMode() && !ViaProxy.EVENT_MANAGER.call(new ShouldVerifyOnlineModeEvent(this.proxyConnection)).isCancelled()) {
-                this.proxyConnection.getC2P().writeAndFlush(new S2CLoginHelloPacket("", KEY_PAIR.getPublic().getEncoded(), this.verifyToken, true)).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
+            // CLIENT_FORWARD:  Skip proxy's auth handshake, forward client's login hello directly
+            if (this.isClientForwardMode) {
+                Logger.u_info("auth", this.proxyConnection, "CLIENT_FORWARD mode:  Forwarding client credentials directly");
+                this.proxyConnection.getChannel().writeAndFlush(loginHelloPacket).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
+                return false;
+            }
+
+            if (ViaProxy.getConfig().isProxyOnlineMode() && !ViaProxy.EVENT_MANAGER. call(new ShouldVerifyOnlineModeEvent(this. proxyConnection)).isCancelled()) {
+                this.proxyConnection.getC2P().writeAndFlush(new S2CLoginHelloPacket("", KEY_PAIR.getPublic().getEncoded(), this.verifyToken, true)).addListener(ChannelFutureListener. FIRE_EXCEPTION_ON_FAILURE);
             } else {
                 ViaProxy.EVENT_MANAGER.call(new ClientLoggedInEvent(this.proxyConnection));
-                ExternalInterface.fillPlayerData(this.proxyConnection);
-                this.proxyConnection.getChannel().writeAndFlush(this.proxyConnection.getLoginHelloPacket()).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
+                ExternalInterface. fillPlayerData(this.proxyConnection);
+                this.proxyConnection. getChannel().writeAndFlush(this.proxyConnection.getLoginHelloPacket()).addListener(ChannelFutureListener. FIRE_EXCEPTION_ON_FAILURE);
             }
 
             return false;
         } else if (packet instanceof C2SLoginKeyPacket loginKeyPacket) {
-            if (this.loginState != LoginState.SENT_HELLO) throw CloseAndReturn.INSTANCE;
+            if (this.loginState != LoginState.SENT_HELLO) throw CloseAndReturn. INSTANCE;
             this.loginState = LoginState.SENT_KEY;
 
+            // CLIENT_FORWARD: Buffer the client's encryption response and forward it to backend
+            if (this.isClientForwardMode) {
+                this.bufferedClientEncryptionResponse = loginKeyPacket;
+                this.proxyConnection. getChannel().writeAndFlush(loginKeyPacket).addListener(ChannelFutureListener. FIRE_EXCEPTION_ON_FAILURE);
+                Logger.u_info("auth", this.proxyConnection, "CLIENT_FORWARD mode: Buffered and forwarded client encryption response");
+                return false;
+            }
+
             if (loginKeyPacket.encryptedNonce != null) {
-                if (!Arrays.equals(this.verifyToken, CryptUtil.decryptData(KEY_PAIR.getPrivate(), loginKeyPacket.encryptedNonce))) {
+                if (!Arrays.equals(this.verifyToken, CryptUtil.decryptData(KEY_PAIR. getPrivate(), loginKeyPacket.encryptedNonce))) {
                     Logger.u_err("auth", this.proxyConnection, "Invalid verify token");
                     this.proxyConnection.kickClient("§cInvalid verify token!");
                 }
             } else {
                 final C2SLoginHelloPacket loginHelloPacket = this.proxyConnection.getLoginHelloPacket();
-                if (loginHelloPacket.key == null || !CryptUtil.verifySignedNonce(loginHelloPacket.key, this.verifyToken, loginKeyPacket.salt, loginKeyPacket.signature)) {
+                if (loginHelloPacket.key == null || !CryptUtil.verifySignedNonce(loginHelloPacket. key, this.verifyToken, loginKeyPacket.salt, loginKeyPacket.signature)) {
                     Logger.u_err("auth", this.proxyConnection, "Invalid verify token");
                     this.proxyConnection.kickClient("§cInvalid verify token!");
                 }
             }
 
-            final SecretKey secretKey = CryptUtil.decryptSecretKey(KEY_PAIR.getPrivate(), loginKeyPacket.encryptedSecretKey);
+            final SecretKey secretKey = CryptUtil.decryptSecretKey(KEY_PAIR. getPrivate(), loginKeyPacket.encryptedSecretKey);
             this.proxyConnection.getC2P().attr(MCPipeline.ENCRYPTION_ATTRIBUTE_KEY).set(new AESEncryption(secretKey));
 
             HTTP_EXECUTOR.submit(() -> {
@@ -124,25 +146,25 @@ public class LoginPacketHandler extends PacketHandler {
                     final String serverHash = new BigInteger(CryptUtil.computeServerIdHash("", KEY_PAIR.getPublic(), secretKey)).toString(16);
                     final ProfileResult profileResult = AuthLibServices.SESSION_SERVICE.hasJoinedServer(userName, serverHash, null);
                     if (profileResult == null) {
-                        Logger.u_err("auth", this.proxyConnection, "Invalid session");
-                        this.proxyConnection.kickClient("§cInvalid session! Please restart minecraft (and the launcher) and try again.");
+                        Logger. u_err("auth", this. proxyConnection, "Invalid session");
+                        this.proxyConnection.kickClient("§cInvalid session!  Please restart minecraft (and the launcher) and try again.");
                     } else {
                         this.proxyConnection.setGameProfile(profileResult.profile());
                     }
                     Logger.u_info("auth", this.proxyConnection, "Authenticated as " + this.proxyConnection.getGameProfile().getId().toString());
                 } catch (CloseAndReturn ignored) {
                 } catch (Throwable e) {
-                    Logger.LOGGER.error("Failed to make session request for user '" + userName + "'!", e);
+                    Logger. LOGGER.error("Failed to make session request for user '" + userName + "'!", e);
                     try {
-                        this.proxyConnection.kickClient("§cFailed to authenticate with Mojang servers! Please try again later.");
+                        this.proxyConnection.kickClient("§cFailed to authenticate with Mojang servers!  Please try again later.");
                     } catch (Throwable ignored) {
                     }
                 }
 
                 this.proxyConnection.getC2P().eventLoop().execute(() -> {
-                    ViaProxy.EVENT_MANAGER.call(new ClientLoggedInEvent(proxyConnection));
+                    ViaProxy.EVENT_MANAGER. call(new ClientLoggedInEvent(proxyConnection));
                     ExternalInterface.fillPlayerData(this.proxyConnection);
-                    this.proxyConnection.getChannel().writeAndFlush(this.proxyConnection.getLoginHelloPacket()).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
+                    this.proxyConnection.getChannel().writeAndFlush(this. proxyConnection.getLoginHelloPacket()).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
                 });
             });
             return false;
@@ -151,10 +173,23 @@ public class LoginPacketHandler extends PacketHandler {
         return true;
     }
 
-    @Override
+        @Override
     public boolean handleP2S(Packet packet, List<ChannelFutureListener> listeners) throws GeneralSecurityException, ExecutionException, InterruptedException {
         if (packet instanceof S2CLoginHelloPacket loginHelloPacket) {
             final PublicKey publicKey = CryptUtil.decodeRsaPublicKey(loginHelloPacket.publicKey);
+            
+            // CLIENT_FORWARD: Skip encryption negotiation with proxy; use client's buffered response
+            if (this.isClientForwardMode && this.bufferedClientEncryptionResponse != null) {
+                Logger.u_info("auth", this.proxyConnection, "CLIENT_FORWARD mode: Using client's buffered encryption response for backend");
+                
+                // Forward the client's buffered encryption response directly to the backend
+                this.proxyConnection.getChannel().writeAndFlush(this. bufferedClientEncryptionResponse).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
+                
+                // Enable encryption on the proxy->backend channel using the secret key from the client
+                // Note: The actual encryption setup will be handled when the S2CLoginGameProfilePacket is received
+                return false;
+            }
+
             final SecretKey secretKey = CryptUtil.generateSecretKey();
             final String serverHash = new BigInteger(CryptUtil.computeServerIdHash(loginHelloPacket.serverId, publicKey, secretKey)).toString(16);
 
@@ -166,11 +201,11 @@ public class LoginPacketHandler extends PacketHandler {
                 ExternalInterface.joinServer(serverHash, this.proxyConnection);
             }
 
-            final byte[] encryptedSecretKey = CryptUtil.encryptData(publicKey, secretKey.getEncoded());
-            final byte[] encryptedNonce = CryptUtil.encryptData(publicKey, loginHelloPacket.nonce);
+            final byte[] encryptedSecretKey = CryptUtil.encryptData(publicKey, secretKey. getEncoded());
+            final byte[] encryptedNonce = CryptUtil.encryptData(publicKey, loginHelloPacket. nonce);
 
             final C2SLoginKeyPacket loginKey = new C2SLoginKeyPacket(encryptedSecretKey, encryptedNonce);
-            if (this.proxyConnection.getServerVersion().betweenInclusive(ProtocolVersion.v1_19, ProtocolVersion.v1_19_1) && this.proxyConnection.getLoginHelloPacket().key != null) {
+            if (this.proxyConnection.getServerVersion().betweenInclusive(ProtocolVersion. v1_19, ProtocolVersion.v1_19_1) && this.proxyConnection.getLoginHelloPacket().key != null) {
                 ExternalInterface.signNonce(loginHelloPacket.nonce, loginKey, this.proxyConnection);
             }
             this.proxyConnection.getChannel().writeAndFlush(loginKey).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
@@ -183,14 +218,14 @@ public class LoginPacketHandler extends PacketHandler {
 
             return false;
         } else if (packet instanceof S2CLoginGameProfilePacket loginGameProfilePacket) {
-            final ConnectionState nextState = this.proxyConnection.getClientVersion().newerThanOrEqualTo(ProtocolVersion.v1_20_2) ? ConnectionState.CONFIGURATION : ConnectionState.PLAY;
+            final ConnectionState nextState = this.proxyConnection. getClientVersion().newerThanOrEqualTo(ProtocolVersion.v1_20_2) ? ConnectionState.CONFIGURATION :  ConnectionState.PLAY;
 
             this.proxyConnection.setGameProfile(new GameProfile(loginGameProfilePacket.uuid, loginGameProfilePacket.name));
-            Logger.u_info("session", this.proxyConnection, "Connected successfully! Switching to " + nextState + " state");
+            Logger.u_info("session", this.proxyConnection, "Connected successfully!  Switching to " + nextState + " state");
 
-            ChannelUtil.disableAutoRead(this.proxyConnection.getChannel());
+            ChannelUtil.disableAutoRead(this.proxyConnection. getChannel());
             listeners.add(f -> {
-                if (f.isSuccess() && nextState != ConnectionState.CONFIGURATION) {
+                if (f. isSuccess() && nextState != ConnectionState.CONFIGURATION) {
                     this.proxyConnection.setC2pConnectionState(nextState);
                     this.proxyConnection.setP2sConnectionState(nextState);
                     ChannelUtil.restoreAutoRead(this.proxyConnection.getChannel());

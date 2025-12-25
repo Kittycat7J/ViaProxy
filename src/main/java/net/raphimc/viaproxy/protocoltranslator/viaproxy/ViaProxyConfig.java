@@ -17,14 +17,26 @@
  */
 package net.raphimc.viaproxy.protocoltranslator.viaproxy;
 
+import java.io.File;
+import java.net.SocketAddress;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Stack;
+
 import com.viaversion.viaversion.api.protocol.version.ProtocolVersion;
+
 import joptsimple.OptionException;
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
 import joptsimple.OptionSpec;
 import net.lenni0451.optconfig.ConfigContext;
 import net.lenni0451.optconfig.ConfigLoader;
-import net.lenni0451.optconfig.annotations.*;
+import net.lenni0451.optconfig.annotations.Description;
+import net.lenni0451.optconfig.annotations.NotReloadable;
+import net.lenni0451.optconfig.annotations.OptConfig;
+import net.lenni0451.optconfig.annotations.Option;
+import net.lenni0451.optconfig.annotations.TypeSerializer;
+import net.lenni0451.optconfig.annotations.Validator;
 import net.lenni0451.optconfig.index.ClassIndexer;
 import net.lenni0451.optconfig.index.ConfigType;
 import net.lenni0451.optconfig.index.types.ConfigOption;
@@ -39,14 +51,12 @@ import net.raphimc.viaproxy.protocoltranslator.ProtocolTranslator;
 import net.raphimc.viaproxy.saves.impl.accounts.Account;
 import net.raphimc.viaproxy.util.AddressUtil;
 import net.raphimc.viaproxy.util.Proxy;
-import net.raphimc.viaproxy.util.config.*;
+import net.raphimc.viaproxy.util.config.AccountTypeSerializer;
+import net.raphimc.viaproxy.util.config.ProtocolVersionTypeSerializer;
+import net.raphimc.viaproxy.util.config.ProxyTypeSerializer;
+import net.raphimc.viaproxy.util.config.SocketAddressTypeSerializer;
+import net.raphimc.viaproxy.util.config.TargetAddressTypeSerializer;
 import net.raphimc.viaproxy.util.logging.Logger;
-
-import java.io.File;
-import java.net.SocketAddress;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Stack;
 
 @OptConfig(header = "ViaProxy configuration file", version = 1)
 public class ViaProxyConfig {
@@ -84,7 +94,8 @@ public class ViaProxyConfig {
     @Description({
             "The authentication method to use for joining the target server.",
             "none: No authentication (Offline mode)",
-            "account: Use an account for joining the target server. (Has to be configured in ViaProxy GUI)"
+            "account: Use an account for joining the target server. (Has to be configured in ViaProxy GUI)",
+            "CLIENT_FORWARD: Forward client's authentication tokens directly to the backend"
     })
     private AuthMethod authMethod = AuthMethod.NONE;
 
@@ -604,11 +615,17 @@ public class ViaProxyConfig {
         /**
          * Use an account for joining the target server (Has to be configured in ViaProxy GUI)
          */
-        ACCOUNT("tab.general.minecraft_account.option_select_account"),
+        ACCOUNT("tab.general.minecraft_account. option_select_account"),
         /**
          * No authentication (Offline mode)
          */
-        NONE("tab.general.minecraft_account.option_no_account");
+        NONE("tab.general.minecraft_account.option_no_account"),
+        /**
+         * Forward the client's authentication tokens directly to the backend server. 
+         * The proxy does not perform its own encryption/auth handshake.
+         * Intended for Mineflayer bots and other authenticated clients.
+         */
+        CLIENT_FORWARD("tab.general.minecraft_account.option_client_forward");
 
         private final String guiTranslationKey;
 
